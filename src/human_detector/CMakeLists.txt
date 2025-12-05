@@ -16,6 +16,7 @@ find_package(rclcpp_action REQUIRED)
 find_package(tf2 REQUIRED)
 find_package(tf2_ros REQUIRED)
 find_package(tf2_geometry_msgs REQUIRED)
+find_package(visualization_msgs REQUIRED)   # <-- FIXED (add this)
 
 add_executable(human_detector src/human_detector.cpp)
 
@@ -29,6 +30,7 @@ ament_target_dependencies(human_detector
   tf2
   tf2_ros
   tf2_geometry_msgs
+  visualization_msgs       # <-- FIXED (add this)
 )
 
 install(TARGETS human_detector
