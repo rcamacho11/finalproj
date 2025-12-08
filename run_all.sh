@@ -4,6 +4,7 @@ echo "=== CLEANING OLD PROCESSES ==="
 pkill -f gazebo 2>/dev/null
 pkill -f nav2 2>/dev/null
 pkill -f human_detector 2>/dev/null
+pkill -f rviz2 2>/dev/null
 sleep 2
 
 tmux kill-session -t finalproj 2>/dev/null
@@ -71,5 +72,16 @@ echo '=== MONITORING HUMANS DETECTED ==='
 watch grep 'HUMAN' ~/detector.log
 " C-m
 
-tmux attach-session -t finalproj
+# =========================
+# PANEL 5 — RVIZ
+# =========================
+tmux split-window -v
+tmux send-keys "
+echo '=== STARTING RVIZ ==='
+source /opt/ros/jazzy/setup.bash
+source /MRTP/install/setup.bash
+sleep 2
+rviz2 -d /path/to/your/config.rviz
+" C-m
 
+tmux attach-session -t finalproj
