@@ -8,6 +8,7 @@
 #include <fstream>
 #include <sstream>
 #include <cstdlib>
+#include <functional>
 
 #include "rclcpp/rclcpp.hpp"
 #include "rclcpp_action/rclcpp_action.hpp"
@@ -15,6 +16,12 @@
 #include "nav2_msgs/action/navigate_to_pose.hpp"
 #include "sensor_msgs/msg/laser_scan.hpp"
 #include "geometry_msgs/msg/pose_stamped.hpp"
+#include "geometry_msgs/msg/point_stamped.hpp"
+#include "nav_msgs/msg/occupancy_grid.hpp"
+
+#include "tf2_ros/buffer.h"
+#include "tf2_ros/transform_listener.h"
+#include "tf2_geometry_msgs/tf2_geometry_msgs.hpp"
 
 using namespace std::chrono_literals;
 
@@ -30,307 +37,371 @@ public:
   {
     RCLCPP_INFO(this->get_logger(), "HumanDetector node starting...");
 
-    // Decide CSV path: $HOME/detected_humans.csv or /tmp fallback
+    // ============================================
+    // CSV path + reset on launch
+    // ============================================
     const char *home = std::getenv("HOME");
     if (home) {
       human_csv_path_ = std::string(home) + "/detected_humans.csv";
     } else {
       human_csv_path_ = "/tmp/detected_humans.csv";
     }
-    RCLCPP_INFO(this->get_logger(), "Using human CSV path: %s", human_csv_path_.c_str());
+    reset_human_csv();
 
-    // Load any previously detected humans
-    load_detected_humans_from_csv();
+    // ============================================
+    // TF buffer + listener
+    // ============================================
+    tf_buffer_   = std::make_shared<tf2_ros::Buffer>(this->get_clock());
+    tf_listener_ = std::make_shared<tf2_ros::TransformListener>(*tf_buffer_);
 
-    // Action client for Nav2
+    // ============================================
+    // Action client (Nav2)
+    // ============================================
     nav_client_ = rclcpp_action::create_client<NavigateToPose>(this, "navigate_to_pose");
 
-    // Subscribe to laser scan
+    // ============================================
+    // LASER
+    // ============================================
     scan_sub_ = this->create_subscription<sensor_msgs::msg::LaserScan>(
       "/scan",
       10,
       std::bind(&HumanDetector::scan_callback, this, std::placeholders::_1)
     );
 
-    // Simple random wandering timer
-    wander_timer_ = this->create_wall_timer(
-      3s,
-      std::bind(&HumanDetector::wander_loop, this)
+    // ============================================
+    // MAP (latched/TransitentLocal → fixes waiting bug)
+    // ============================================
+    rclcpp::QoS map_qos(10);
+    map_qos.transient_local().reliable();
+
+    map_sub_ = this->create_subscription<nav_msgs::msg::OccupancyGrid>(
+      "/map",
+      map_qos,
+      std::bind(&HumanDetector::map_callback, this, std::placeholders::_1)
     );
 
-    // Cooldown timer (created but immediately cancelled; we enable it when needed)
+    // ============================================
+    // Coverage movement loop
+    // ============================================
+    coverage_timer_ = this->create_wall_timer(
+      1s,
+      std::bind(&HumanDetector::coverage_navigation_loop, this)
+    );
+
+    // ============================================
+    // Cooldown timer (off until needed)
+    // ============================================
     detection_cooldown_timer_ = this->create_wall_timer(
       5s,
       std::bind(&HumanDetector::cooldown_end, this)
     );
     detection_cooldown_timer_->cancel();
 
-    RCLCPP_INFO(this->get_logger(), "HumanDetector node initialized.");
+    RCLCPP_INFO(this->get_logger(), "HumanDetector initialized.");
   }
 
 private:
+
+  // =======================
+  // HUMAN STORAGE STRUCT
+  // =======================
   struct HumanRecord
   {
-    int id;
+    int   id;
     float x;
     float y;
   };
 
-  // Subscribers / action clients / timers
-  rclcpp::Subscription<sensor_msgs::msg::LaserScan>::SharedPtr scan_sub_;
+  // ROS interfaces
+  rclcpp::Subscription<sensor_msgs::msg::LaserScan>::SharedPtr   scan_sub_;
+  rclcpp::Subscription<nav_msgs::msg::OccupancyGrid>::SharedPtr  map_sub_;
   rclcpp_action::Client<NavigateToPose>::SharedPtr nav_client_;
-  rclcpp::TimerBase::SharedPtr wander_timer_;
+  rclcpp::TimerBase::SharedPtr coverage_timer_;
   rclcpp::TimerBase::SharedPtr detection_cooldown_timer_;
 
-  // Random generator for wandering
-  std::mt19937 rng_;
+  // TF
+  std::shared_ptr<tf2_ros::Buffer> tf_buffer_;
+  std::shared_ptr<tf2_ros::TransformListener> tf_listener_;
 
   // Human detection state
   bool human_recently_detected_ = false;
-  int human_count_ = 0;
-
-  // Stored human zones (both in memory & mirrored to CSV)
+  int  human_count_ = 0;
   std::vector<HumanRecord> humans_;
   std::string human_csv_path_;
 
-  // Detection parameters
-  const float detection_distance_threshold_ = 0.8f;   // meters
-  const float zone_half_size_ = 1.0f;                // ±1m → 2m × 2m zone
+  // Coverage state
+  bool map_received_    = false;
+  bool coverage_built_  = false;
+  bool navigating_      = false;
 
-  // -------------------------------------------------------------
-  // CSV helpers
-  // -------------------------------------------------------------
+  nav_msgs::msg::OccupancyGrid::SharedPtr latest_map_;
+  std::vector<geometry_msgs::msg::PoseStamped> coverage_path_;
+  size_t current_wp_index_ = 0;
 
-  void load_detected_humans_from_csv()
+  // Parameters
+  const float detection_distance_threshold_ = 0.8f;
+  const float zone_half_size_ = 1.0f;
+  const double stripe_spacing_m_ = 2.0;
+  const double along_spacing_m_  = 1.0;
+  const int8_t occupancy_threshold_ = 50;
+
+  std::mt19937 rng_;
+
+  // ===============================================================
+  // CSV HELPERS
+  // ===============================================================
+  void reset_human_csv()
   {
-    std::ifstream in(human_csv_path_);
-    if (!in.is_open()) {
-      RCLCPP_INFO(this->get_logger(),
-                  "No existing human CSV found at %s. Starting fresh.",
-                  human_csv_path_.c_str());
-      human_count_ = 0;
-      return;
-    }
+    humans_.clear();
+    human_count_ = 0;
 
-    RCLCPP_INFO(this->get_logger(), "Loading detected humans from CSV...");
-
-    std::string line;
-    bool first_line = true;
-    int max_id = 0;
-
-    while (std::getline(in, line)) {
-      if (line.empty()) continue;
-
-      // Skip header if present
-      if (first_line) {
-        first_line = false;
-        if (line.find("id") != std::string::npos) {
-          // Looks like a header, skip
-          continue;
-        }
-      }
-
-      std::stringstream ss(line);
-      std::string token;
-      HumanRecord rec;
-
-      // id
-      if (!std::getline(ss, token, ',')) continue;
-      rec.id = std::stoi(token);
-
-      // x
-      if (!std::getline(ss, token, ',')) continue;
-      rec.x = std::stof(token);
-
-      // y
-      if (!std::getline(ss, token, ',')) continue;
-      rec.y = std::stof(token);
-
-      humans_.push_back(rec);
-      if (rec.id > max_id) {
-        max_id = rec.id;
-      }
-    }
-
-    human_count_ = max_id;
-    RCLCPP_INFO(this->get_logger(),
-                "Loaded %zu humans from CSV. Next id will be %d.",
-                humans_.size(), human_count_ + 1);
+    std::ofstream out(human_csv_path_, std::ios::trunc);
+    out << "id,x,y\n";
+    RCLCPP_INFO(this->get_logger(), "Human CSV reset.");
   }
 
   void append_human_to_csv(const HumanRecord &rec)
   {
-    bool file_exists = false;
-    {
-      std::ifstream test(human_csv_path_);
-      file_exists = test.good();
-    }
-
     std::ofstream out(human_csv_path_, std::ios::app);
-    if (!out.is_open()) {
-      RCLCPP_WARN(this->get_logger(),
-                  "Failed to open CSV file for writing: %s",
-                  human_csv_path_.c_str());
-      return;
-    }
-
-    // If file did not exist, write header first
-    if (!file_exists) {
-      out << "id,x,y\n";
-    }
-
     out << rec.id << "," << rec.x << "," << rec.y << "\n";
-    out.flush();
   }
 
-  // -------------------------------------------------------------
-  // Check if a detection falls inside an existing human zone
-  // (2m × 2m box centered at each stored (x, y))
-  // These coordinates are in the robot's frame at time of detection.
-  // -------------------------------------------------------------
   bool is_new_human(float x, float y)
   {
     for (const auto &h : humans_) {
-      if (std::fabs(x - h.x) < zone_half_size_ &&
-          std::fabs(y - h.y) < zone_half_size_) {
-        // Already detected a human in this region
+      if (fabs(x - h.x) < zone_half_size_ &&
+          fabs(y - h.y) < zone_half_size_) {
         return false;
       }
     }
     return true;
   }
 
-  // -------------------------------------------------------------
-  // LASER SCAN CALLBACK
-  // -------------------------------------------------------------
-  void scan_callback(const sensor_msgs::msg::LaserScan::SharedPtr msg)
+  // ===============================================================
+  // MAP CALLBACK — Build Boustrophedon Pattern
+  // ===============================================================
+  void map_callback(const nav_msgs::msg::OccupancyGrid::SharedPtr msg)
   {
-    // If we are in cooldown, ignore new detections
-    if (human_recently_detected_) {
-      return;
+    latest_map_ = msg;
+    map_received_ = true;
+
+    if (!coverage_built_) {
+      RCLCPP_INFO(this->get_logger(), "Map received — building coverage path...");
+      build_coverage_from_map(*msg);
     }
+  }
 
-    float min_dist = std::numeric_limits<float>::max();
-    int min_index = -1;
+  bool is_cell_free(const nav_msgs::msg::OccupancyGrid &map, int x, int y)
+  {
+    if (x < 0 || y < 0 ||
+        x >= (int)map.info.width ||
+        y >= (int)map.info.height)
+      return false;
 
-    // Find closest valid range
-    for (size_t i = 0; i < msg->ranges.size(); ++i) {
-      float r = msg->ranges[i];
-      if (std::isfinite(r) && r < min_dist) {
-        min_dist = r;
-        min_index = static_cast<int>(i);
+    int idx = y * map.info.width + x;
+    int8_t v = map.data[idx];
+
+    if (v < 0) return false; // unknown
+    return v <= occupancy_threshold_; 
+  }
+
+  geometry_msgs::msg::PoseStamped cell_to_pose(
+      const nav_msgs::msg::OccupancyGrid &map, int x, int y)
+  {
+    geometry_msgs::msg::PoseStamped p;
+    p.header.frame_id = "map";
+    p.header.stamp = this->now();
+
+    double res = map.info.resolution;
+
+    p.pose.position.x =
+        map.info.origin.position.x + (x + 0.5) * res;
+    p.pose.position.y =
+        map.info.origin.position.y + (y + 0.5) * res;
+
+    p.pose.orientation.w = 1.0;
+    return p;
+  }
+
+  void build_coverage_from_map(const nav_msgs::msg::OccupancyGrid &map)
+  {
+    coverage_path_.clear();
+    current_wp_index_ = 0;
+
+    int width  = map.info.width;
+    int height = map.info.height;
+    double res = map.info.resolution;
+
+    int row_step = std::max(1, (int)(stripe_spacing_m_ / res));
+    int col_step = std::max(1, (int)(along_spacing_m_  / res));
+
+    bool left_to_right = true;
+
+    for (int y = 0; y < height; y += row_step) {
+
+      bool row_has_waypoints = false;
+
+      if (left_to_right) {
+        for (int x = 0; x < width; x += col_step) {
+          if (!is_cell_free(map, x, y)) continue;
+          coverage_path_.push_back(cell_to_pose(map, x, y));
+          row_has_waypoints = true;
+        }
+      } else {
+        for (int x = width - 1; x >= 0; x -= col_step) {
+          if (!is_cell_free(map, x, y)) continue;
+          coverage_path_.push_back(cell_to_pose(map, x, y));
+          row_has_waypoints = true;
+        }
       }
+
+      if (row_has_waypoints)
+        left_to_right = !left_to_right;
     }
 
-    // No valid reading
-    if (min_index < 0) {
+    if (coverage_path_.empty()) {
+      RCLCPP_WARN(this->get_logger(), "Coverage path EMPTY — no free space!");
       return;
     }
 
-    // Too far → not considered a human
-    if (min_dist >= detection_distance_threshold_) {
-      return;
-    }
-
-    // Compute angle and convert to robot-frame coordinates
-    float angle = msg->angle_min + min_index * msg->angle_increment;
-    float x = min_dist * std::cos(angle);
-    float y = min_dist * std::sin(angle);
-
-    // Check if this is a new human zone
-    if (!is_new_human(x, y)) {
-      // Already have a human in this region
-      return;
-    }
-
-    // This is a NEW human
-    human_recently_detected_ = true;
-    human_count_++;
-
-    HumanRecord rec;
-    rec.id = human_count_;
-    rec.x  = x;
-    rec.y  = y;
-
-    humans_.push_back(rec);
-    append_human_to_csv(rec);
-
-    RCLCPP_WARN(
-      this->get_logger(),
-      "NEW HUMAN %d DETECTED at (x=%.2f, y=%.2f), dist=%.2f m. Total humans: %d",
-      rec.id, rec.x, rec.y, min_dist, human_count_
-    );
-
-    // Stop wandering while we "handle" this human (e.g., for grading / inspection)
-    if (wander_timer_) {
-      wander_timer_->cancel();
-    }
-
-    // Start cooldown so we do not immediately detect again
-    if (detection_cooldown_timer_) {
-      detection_cooldown_timer_->reset();
-    }
-  }
-
-  // -------------------------------------------------------------
-  // COOLDOWN → resume searching
-  // -------------------------------------------------------------
-  void cooldown_end()
-  {
-    human_recently_detected_ = false;
+    coverage_built_ = true;
     RCLCPP_INFO(this->get_logger(),
-                "Cooldown complete → continuing human search.");
-
-    if (wander_timer_) {
-      wander_timer_->reset();
-    }
-    if (detection_cooldown_timer_) {
-      detection_cooldown_timer_->cancel();
-    }
+                "Coverage path built: %zu waypoints.",
+                coverage_path_.size());
   }
 
-  // -------------------------------------------------------------
-  // SIMPLE WANDERING
-  // -------------------------------------------------------------
-  void wander_loop()
+  // ===============================================================
+  // COVERAGE NAVIGATION LOOP
+  // ===============================================================
+  void coverage_navigation_loop()
   {
-    // Optional: do not send goals while we are in cooldown
-    if (human_recently_detected_) {
+    if (human_recently_detected_) return;
+
+    if (!map_received_) {
+      RCLCPP_INFO_THROTTLE(
+        this->get_logger(), *this->get_clock(), 3000,
+        "Waiting for /map (latched)...");
+      return;
+    }
+
+    if (!coverage_built_) return;
+    if (navigating_) return;
+
+    if (current_wp_index_ >= coverage_path_.size()) {
+      RCLCPP_INFO_THROTTLE(
+         this->get_logger(), *this->get_clock(), 10000,
+         "Coverage finished.");
       return;
     }
 
     if (!nav_client_->wait_for_action_server(1s)) {
-      RCLCPP_WARN(this->get_logger(), "Nav2 action server unavailable.");
+      RCLCPP_WARN_THROTTLE(
+         this->get_logger(), *this->get_clock(), 5000,
+         "Nav2 not ready.");
       return;
     }
 
-    // Simple random goal around the robot (in map frame)
-    std::uniform_real_distribution<float> dist(-2.0f, 2.0f);
-    float x = dist(rng_);
-    float y = dist(rng_);
+    auto goal = NavigateToPose::Goal();
+    goal.pose = coverage_path_[current_wp_index_];
 
     RCLCPP_INFO(this->get_logger(),
-                "Wandering to random goal (%.2f, %.2f)", x, y);
+                "Sending coverage goal %zu/%zu",
+                current_wp_index_+1,
+                coverage_path_.size());
 
-    auto goal_msg = NavigateToPose::Goal();
-    goal_msg.pose.header.frame_id = "map";
-    goal_msg.pose.header.stamp    = this->now();
-    goal_msg.pose.pose.position.x = x;
-    goal_msg.pose.pose.position.y = y;
-    goal_msg.pose.pose.orientation.w = 1.0;  // facing forward, no rotation
+    navigating_ = true;
 
-    nav_client_->async_send_goal(goal_msg);
+    rclcpp_action::Client<NavigateToPose>::SendGoalOptions opts;
+
+    opts.goal_response_callback =
+      [this](auto handle)
+      {
+        if (!handle) {
+          RCLCPP_WARN(this->get_logger(), "Goal rejected");
+          navigating_ = false;
+        }
+      };
+
+    opts.result_callback =
+      [this](auto)
+      {
+        navigating_ = false;
+        current_wp_index_++;
+      };
+
+    nav_client_->async_send_goal(goal, opts);
+  }
+
+  // ===============================================================
+  // LASER → HUMAN DETECTION (MAP FRAME)
+  // ===============================================================
+  void scan_callback(const sensor_msgs::msg::LaserScan::SharedPtr msg)
+  {
+    if (human_recently_detected_) return;
+    if (!coverage_built_) return;
+
+    float min_dist = std::numeric_limits<float>::max();
+    int min_idx = -1;
+
+    for (int i = 0; i < (int)msg->ranges.size(); i++) {
+      float r = msg->ranges[i];
+      if (std::isfinite(r) && r < min_dist) {
+        min_dist = r;
+        min_idx = i;
+      }
+    }
+
+    if (min_idx < 0) return;
+    if (min_dist >= detection_distance_threshold_) return;
+
+    float angle = msg->angle_min + min_idx * msg->angle_increment;
+
+    geometry_msgs::msg::PointStamped p_laser, p_map;
+    p_laser.header.frame_id = msg->header.frame_id;
+    p_laser.header.stamp    = msg->header.stamp;
+    p_laser.point.x = min_dist * std::cos(angle);
+    p_laser.point.y = min_dist * std::sin(angle);
+
+    try {
+      p_map = tf_buffer_->transform(p_laser, "map", 50ms);
+    } catch (...) {
+      return;
+    }
+
+    float x = p_map.point.x;
+    float y = p_map.point.y;
+
+    if (!is_new_human(x, y)) return;
+
+    human_recently_detected_ = true;
+    human_count_++;
+
+    HumanRecord rec{human_count_, x, y};
+    humans_.push_back(rec);
+    append_human_to_csv(rec);
+
+    RCLCPP_WARN(this->get_logger(),
+                "NEW HUMAN %d at MAP (%.2f, %.2f)",
+                rec.id, x, y);
+
+    detection_cooldown_timer_->reset();
+  }
+
+  // ===============================================================
+  // COOLDOWN
+  // ===============================================================
+  void cooldown_end()
+  {
+    human_recently_detected_ = false;
+    detection_cooldown_timer_->cancel();
+    RCLCPP_INFO(this->get_logger(), "Cooldown complete → resuming search.");
   }
 };
 
-// -------------------------------------------------------------
-// main()
-// -------------------------------------------------------------
 int main(int argc, char **argv)
 {
   rclcpp::init(argc, argv);
-  auto node = std::make_shared<HumanDetector>();
-  rclcpp::spin(node);
+  rclcpp::spin(std::make_shared<HumanDetector>());
   rclcpp::shutdown();
   return 0;
 }
